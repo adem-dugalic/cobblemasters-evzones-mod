@@ -61,17 +61,20 @@ public final class ZoneSpawnManager {
     }
 
     private static int countPokemonInZone(ServerWorld world, SpawnZone zone) {
+        // Use a tall box so Pokémon at any Y level within the zone are counted
         Box box = new Box(
-                zone.x - zone.radius, zone.y - zone.radius, zone.z - zone.radius,
-                zone.x + zone.radius, zone.y + zone.radius, zone.z + zone.radius);
+                zone.x - zone.radius, zone.y - 32, zone.z - zone.radius,
+                zone.x + zone.radius, zone.y + 32, zone.z + zone.radius);
 
         List<Entity> entities = world.getEntitiesByClass(Entity.class, box, entity -> {
             Identifier typeId = net.minecraft.registry.Registries.ENTITY_TYPE.getId(entity.getType());
             boolean isPokemon = typeId != null
                     && "cobblemon".equals(typeId.getNamespace())
                     && "pokemon".equals(typeId.getPath());
-            boolean inRadius = entity.squaredDistanceTo(zone.x, zone.y, zone.z)
-                    <= zone.radius * zone.radius;
+            // XZ-only cylinder check — ignores Y so Pokémon on different levels still count
+            double dx = entity.getX() - zone.x;
+            double dz = entity.getZ() - zone.z;
+            boolean inRadius = (dx * dx + dz * dz) <= zone.radius * zone.radius;
             return isPokemon && inRadius;
         });
 
