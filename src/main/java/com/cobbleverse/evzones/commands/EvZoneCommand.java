@@ -94,6 +94,17 @@ public final class EvZoneCommand {
                 // /evzone reload
                 .then(CommandManager.literal("reload")
                         .executes(ctx -> reload(ctx.getSource())))
+
+                // /evzone debug
+                .then(CommandManager.literal("debug")
+                        .executes(ctx -> toggleDebug(ctx.getSource())))
+
+                // /evzone count <name>
+                .then(CommandManager.literal("count")
+                        .then(CommandManager.argument("name", StringArgumentType.word())
+                                .executes(ctx -> count(
+                                        ctx.getSource(),
+                                        StringArgumentType.getString(ctx, "name")))))
         );
     }
 
@@ -230,6 +241,64 @@ public final class EvZoneCommand {
     private static int reload(ServerCommandSource source) {
         ZoneConfig.load();
         source.sendFeedback(() -> Text.literal("§aEV zones reloaded. §f" + ZoneConfig.get().zones.size() + " zones active."), true);
+        return 1;
+    }
+
+    private static int toggleDebug(ServerCommandSource source) {
+        boolean newState = !ZoneSpawnManager.isDebugMode();
+        ZoneSpawnManager.setDebugMode(newState);
+        source.sendFeedback(() -> Text.literal(
+                newState ? "§aEV Zones debug mode §eENABLED§a. Check server console for entity logs."
+                         : "§aEV Zones debug mode §cDISABLED§a."), true);
+        return 1;
+    }
+
+    private static int count(ServerCommandSource source, String name) {
+        SpawnZone zone = ZoneConfig.findByName(name);
+        if (zone == null) {
+            source.sendError(Text.literal("Zone '" + name + "' not found.").formatted(Formatting.RED));
+            return 0;
+        }
+
+        net.minecraft.registry.RegistryKey<net.minecraft.world.World> worldKey =
+                net.minecraft.registry.RegistryKey.of(
+                        net.minecraft.registry.RegistryKeys.WORLD,
+                        net.minecraft.util.Identifier.of(zone.dimension));
+        net.minecraft.server.world.ServerWorld world = source.getServer().getWorld(worldKey);
+        if (world == null) {
+            source.sendError(Text.literal("Dimension '" + zone.dimension + "' not found.").formatted(Formatting.RED));
+            return 0;
+        }
+
+        // Show tracked count (the authoritative count used by the spawn manager)
+        int trackedCount = ZoneSpawnManager.getTrackedCount(world, zone);
+
+        source.sendFeedback(() -> Text.literal("§6§l=== Zone: " + zone.name + " ==="), false);
+        source.sendFeedback(() -> Text.literal("§bTracked alive: §f" + trackedCount + " / " + zone.maxCount), false);
+
+        // Also show tracked UUIDs for debug
+        if (zone.trackedPokemon != null) {
+            for (java.util.UUID uuid : zone.trackedPokemon) {
+                net.minecraft.entity.Entity entity = world.getEntity(uuid);
+                if (entity != null) {
+                    source.sendFeedback(() -> Text.literal(
+                            "  §a[ALIVE] §f" + uuid.toString().substring(0, 8) + "... §7"
+                            + entity.getClass().getSimpleName()
+                            + " §7at (" + String.format("%.0f, %.0f, %.0f", entity.getX(), entity.getY(), entity.getZ()) + ")"
+                    ), false);
+                }
+            }
+        }
+
+        // For comparison, also show area-scan count (may differ if Pokemon wandered out)
+        net.minecraft.util.math.Box box = new net.minecraft.util.math.Box(
+                zone.x - zone.radius, world.getBottomY(), zone.z - zone.radius,
+                zone.x + zone.radius, world.getTopY(), zone.z + zone.radius);
+        int areaCount = world.getEntitiesByClass(net.minecraft.entity.Entity.class, box,
+                e -> e.getClass().getName().toLowerCase().contains("pokemon")).size();
+        source.sendFeedback(() -> Text.literal(
+                "§7(Area scan in radius: " + areaCount + " — for comparison only)"), false);
+
         return 1;
     }
 }

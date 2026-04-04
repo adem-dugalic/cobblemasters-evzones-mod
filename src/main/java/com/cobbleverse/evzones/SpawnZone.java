@@ -1,5 +1,9 @@
 package com.cobbleverse.evzones;
 
+import java.util.HashSet;
+import java.util.Set;
+import java.util.UUID;
+
 public class SpawnZone {
 
     public String name;
@@ -14,6 +18,9 @@ public class SpawnZone {
 
     // Runtime only — not saved to JSON
     public transient int tickCounter = 0;
+    public transient int pendingSpawns = 0;
+    /** UUIDs of Pokemon this zone has spawned that are still alive in the world. */
+    public transient Set<UUID> trackedPokemon = new HashSet<>();
 
     public SpawnZone() {}
 

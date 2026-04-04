@@ -6,25 +6,57 @@ import net.minecraft.registry.RegistryKeys;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
-import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 
-import java.util.List;
-import java.util.Random;
+import java.util.Iterator;
+import java.util.UUID;
 
 public final class ZoneSpawnManager {
 
-    private static final Random RANDOM = new Random();
+    private static boolean debugMode = false;
 
     private ZoneSpawnManager() {}
 
+    public static void setDebugMode(boolean enabled) {
+        debugMode = enabled;
+    }
+
+    public static boolean isDebugMode() {
+        return debugMode;
+    }
+
     public static void tick(MinecraftServer server) {
+        if (server.getPlayerManager().getPlayerList().isEmpty()) {
+            return;
+        }
+
         for (SpawnZone zone : ZoneConfig.get().zones) {
-            zone.tickCounter++;
-            if (zone.tickCounter >= zone.spawnRateTicks) {
-                zone.tickCounter = 0;
-                trySpawn(server, zone);
+            // Ensure transient field is initialized (e.g. after config reload)
+            if (zone.trackedPokemon == null) {
+                zone.trackedPokemon = new java.util.HashSet<>();
             }
+
+            zone.tickCounter++;
+            if (zone.tickCounter < zone.spawnRateTicks) {
+                continue;
+            }
+            zone.tickCounter = 0;
+
+            boolean playerNearby = false;
+            for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                double dx = player.getX() - zone.x;
+                double dz = player.getZ() - zone.z;
+                double activationRange = Math.max(zone.radius * 2.0, 64.0);
+                if (dx * dx + dz * dz <= activationRange * activationRange) {
+                    playerNearby = true;
+                    break;
+                }
+            }
+            if (!playerNearby) {
+                continue;
+            }
+
+            trySpawn(server, zone);
         }
     }
 
@@ -37,14 +69,23 @@ public final class ZoneSpawnManager {
             return;
         }
 
-        int current = countPokemonInZone(world, zone);
-        if (current >= zone.maxCount) return;
+        // Prune dead/removed entities from the tracked set
+        pruneTrackedPokemon(world, zone);
 
-        // Random position within radius (80% to avoid fence edges)
-        double angle = RANDOM.nextDouble() * 2 * Math.PI;
-        double dist = RANDOM.nextDouble() * zone.radius * 0.8;
-        double spawnX = zone.x + Math.cos(angle) * dist;
-        double spawnZ = zone.z + Math.sin(angle) * dist;
+        int alive = zone.trackedPokemon.size();
+
+        if (debugMode) {
+            EvZonesMod.LOGGER.info("[EVZones DEBUG] Zone '{}': {} tracked alive / {} max",
+                    zone.name, alive, zone.maxCount);
+        }
+
+        if (alive >= zone.maxCount) {
+            return;
+        }
+
+        // Spawn at exact center of the zone
+        double spawnX = zone.x;
+        double spawnZ = zone.z;
 
         try {
             var spawnSource = server.getCommandSource()
@@ -54,30 +95,86 @@ public final class ZoneSpawnManager {
                     .withSilent();
             server.getCommandManager().getDispatcher().execute(
                     "pokespawn " + zone.pokemon, spawnSource);
+
+            // After pokespawn, find newly added entities near the spawn point
+            var nearbyAfter = world.getEntitiesByClass(
+                    Entity.class,
+                    new net.minecraft.util.math.Box(
+                            spawnX - 2, zone.y - 5, spawnZ - 2,
+                            spawnX + 2, zone.y + 5, spawnZ + 2),
+                    e -> !zone.trackedPokemon.contains(e.getUuid()));
+
+            // Track any new Pokemon-like entities (use string check to be safe with classloading)
+            boolean tracked = false;
+            for (Entity entity : nearbyAfter) {
+                String className = entity.getClass().getName().toLowerCase();
+                if (className.contains("pokemon")) {
+                    zone.trackedPokemon.add(entity.getUuid());
+                    if (debugMode) {
+                        EvZonesMod.LOGGER.info("[EVZones DEBUG] Zone '{}': tracked new Pokemon UUID {} ({})",
+                                zone.name, entity.getUuid(), entity.getClass().getSimpleName());
+                    }
+                    tracked = true;
+                }
+            }
+
+            if (!tracked && debugMode) {
+                EvZonesMod.LOGGER.warn("[EVZones DEBUG] Zone '{}': pokespawn ran but no new Pokemon entity found near spawn point!", zone.name);
+            }
+
         } catch (Exception e) {
             EvZonesMod.LOGGER.warn("EV Zone '{}': failed to spawn '{}': {}",
                     zone.name, zone.pokemon, e.getMessage());
         }
     }
 
-    private static int countPokemonInZone(ServerWorld world, SpawnZone zone) {
-        // Use a tall box so Pokémon at any Y level within the zone are counted
-        Box box = new Box(
-                zone.x - zone.radius, zone.y - 32, zone.z - zone.radius,
-                zone.x + zone.radius, zone.y + 32, zone.z + zone.radius);
+    /**
+     * Removes UUIDs from the tracked set if the entity no longer exists in the world
+     * or is dead/removed.
+     */
+    private static void pruneTrackedPokemon(ServerWorld world, SpawnZone zone) {
+        Iterator<UUID> it = zone.trackedPokemon.iterator();
+        while (it.hasNext()) {
+            UUID uuid = it.next();
+            Entity entity = world.getEntity(uuid);
+            if (entity == null || !entity.isAlive() || entity.isRemoved()) {
+                if (debugMode) {
+                    EvZonesMod.LOGGER.info("[EVZones DEBUG] Zone '{}': pruned UUID {} (entity {})",
+                            zone.name, uuid,
+                            entity == null ? "not found" : "dead/removed");
+                }
+                it.remove();
+            }
+        }
+    }
 
-        List<Entity> entities = world.getEntitiesByClass(Entity.class, box, entity -> {
-            Identifier typeId = net.minecraft.registry.Registries.ENTITY_TYPE.getId(entity.getType());
-            boolean isPokemon = typeId != null
-                    && "cobblemon".equals(typeId.getNamespace())
-                    && "pokemon".equals(typeId.getPath());
-            // XZ-only cylinder check — ignores Y so Pokémon on different levels still count
+    /**
+     * Check if a given entity is inside any EV zone.
+     * Returns the zone if found, null otherwise.
+     */
+    public static SpawnZone getZoneContaining(Entity entity) {
+        for (SpawnZone zone : ZoneConfig.get().zones) {
+            String entityDim = entity.getWorld().getRegistryKey().getValue().toString();
+            if (!entityDim.equals(zone.dimension)) continue;
+
             double dx = entity.getX() - zone.x;
             double dz = entity.getZ() - zone.z;
-            boolean inRadius = (dx * dx + dz * dz) <= zone.radius * zone.radius;
-            return isPokemon && inRadius;
-        });
+            if (dx * dx + dz * dz <= zone.radius * zone.radius) {
+                return zone;
+            }
+        }
+        return null;
+    }
 
-        return entities.size();
+    /**
+     * Returns the number of tracked (alive) Pokemon for a zone.
+     * Call pruneTrackedPokemon first for an accurate count.
+     */
+    public static int getTrackedCount(ServerWorld world, SpawnZone zone) {
+        if (zone.trackedPokemon == null) {
+            zone.trackedPokemon = new java.util.HashSet<>();
+        }
+        pruneTrackedPokemon(world, zone);
+        return zone.trackedPokemon.size();
     }
 }
