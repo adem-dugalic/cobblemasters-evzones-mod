@@ -24,3 +24,7 @@ logs/
 
 # Fabric
 remappedSrc/
+
+# IDE build artifacts + local helpers
+bin/
+build_out.txt
